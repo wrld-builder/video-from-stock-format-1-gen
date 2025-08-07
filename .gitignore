@@ -1,0 +1,146 @@
+# === SYSTEM FILES ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === OS & TOOLING ===
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+*.orig
+
+# === ENVIRONMENTS ===
+.env
+.env.*
+*.local
+.vscode/
+.idea/
+*.code-workspace
+
+# === PYTHON ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Poetry / Pipenv / Venv
+.venv/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Jupyter
+.ipynb_checkpoints
+
+# === NODE.JS ===
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+
+# === TYPESCRIPT / JS ===
+*.tsbuildinfo
+dist/
+build/
+coverage/
+
+# === DJANGO ===
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+
+# === FRONTEND ===
+.cache/
+.next/
+.nuxt/
+out/
+.sass-cache/
+.parcel-cache/
+webpack-stats.json
+
+# === JAVA ===
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+target/
+.gradle/
+build/
+
+# === C / C++ ===
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.out
+*.a
+*.lib
+*.dSYM/
+*.gcno
+*.gcda
+*.gcov
+
+# === RUST ===
+/target/
+**/*.rs.bk
+
+# === GO ===
+/bin/
+/pkg/
+/vendor/
+
+# === OTHER ===
+*.sqlite
+*.db
+*.lock
+*.pid
+*.pid.lock
+*.coverage
+
+# === DOCKER ===
+*.pid
+*.seed
+*.pid.lock
+docker-compose.override.yml
+
+# === TESTING ===
+.coverage
+.nyc_output/
+coverage/
+pytest_cache/
+test-results/
+
+# === MONOREPOS ===
+packages/*/node_modules/
+packages/*/dist/
+
+# === BACKUPS ===
+*.bak
+*.old
+*.backup
+*.tmp
+*.temp
+
+# === SECRETS ===
+secrets.yml
+credentials.json
+*.key
+*.pem
+*.crt
+
+# === GIT ===
+!.gitignore
+
+*.mp4
