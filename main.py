@@ -1,106 +1,97 @@
 #!/usr/bin/env python3
 """
 Batch‑builder: fetches the first **N** *HD* portrait clips from Pexels and turns each into a
-≤ 10 s hook‑video with a unique trending CC‑0 soundtrack and the caption
+≤ 10 s hook‑video with a **random trending YouTube Music preview** as soundtrack
+(looked up via iTunes Search) and the caption
 «KITCHEN‑1988 -> DREAM KITCHEN FOR $3,500» (details — see comments 👇).
 
-Guard‑rails
------------
-* **HD‑only input** – width ≥ 720 px, height ≥ 1280 px, quality tag == "hd" (avoids blurry footage).
-* **No down‑scaling** – original resolution/FPS preserved.
-* **x264 CRF 18 + preset slow** – visually loss‑less for socials.
-* Each output trimmed to **≤ 10 s** (so it fits TikTok / YT‑Shorts).
+What changed vs Freesound version
+---------------------------------
+* ❌ Removed Freesound. No FREESOUND_API_KEY needed.
+* ✅ Picks a **random** track from a pool of top/trending YouTube Music items.
+* ✅ Audio is saved as **audio‑only** (ffmpeg `-vn`) — no «video disguised as .mp3».
 
-Env vars (mandatory): `PEXELS_API_KEY`, `FREESOUND_API_KEY`.
+Dependencies
+------------
+`pip install moviepy pillow pilmoji ytmusicapi requests python-dotenv`
+Also install ffmpeg: `sudo apt-get install -y ffmpeg` (recommended).
+
+Env vars (mandatory): `PEXELS_API_KEY`.
 """
 
 from __future__ import annotations
-import os, math, random, shutil, pathlib, datetime as _dt, typing as _t, requests, numpy as np
+import os, random, shutil, pathlib, typing as _t, requests, numpy as np
 from dotenv import load_dotenv
-from moviepy.editor import (
-    VideoFileClip,
-    ImageClip,
-    CompositeVideoClip,
-    AudioFileClip,
-)
+from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip, AudioFileClip
 from moviepy.audio.fx.audio_loop import audio_loop
 from PIL import Image, ImageDraw, ImageFont
 from pilmoji import Pilmoji
+from ytmusicapi import YTMusic
+from urllib.parse import urlparse
+import subprocess
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 load_dotenv()
-PEXELS_API_KEY    = os.getenv("PEXELS_API_KEY")
-FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 if not PEXELS_API_KEY:
     raise SystemExit("PEXELS_API_KEY missing → https://www.pexels.com/api/")
-if not FREESOUND_API_KEY:
-    raise SystemExit("FREESOUND_API_KEY missing → https://freesound.org/docs/api/")
 
-SEARCH_QUERY  = "home remodeling"
-CAPTION_TEXT  = (
+SEARCH_QUERY   = "home remodeling"
+CAPTION_TEXT   = (
     "KITCHEN‑1988 -> DREAM KITCHEN FOR $3,500\n"
     "(details — see comments 👇)"
 )
-VIDEOS_COUNT  = 10           # how many clips per batch
-TREND_DAYS    = 14           # freshness window for viral sounds
-MAX_DURATION  = 10           # s — hard cap for Shorts/Reels
-MIN_WIDTH     = 720          # px — guards against muddy sources
-MIN_HEIGHT    = 1280
+VIDEOS_COUNT   = 3      # how many clips per batch
+MAX_DURATION   = 10      # s — hard cap for Shorts/Reels
+MIN_WIDTH      = 720     # px — guards against muddy sources
+MIN_HEIGHT     = 1280
+YT_COUNTRY     = "US"    # charts storefront
+POOL_SIZE      = 100     # how many previews to try to collect
+CHART_PLAYLISTS = 1      # how many YT chart playlists to combine
 
 FONT_DIR   = "fonts"
 OUT_TMPL   = "hooked_{:02d}.mp4"
 TMP_VIDEO  = "__tmp_vid__.mp4"
-TMP_AUDIO  = "__tmp_aud__.mp3"
-
 PEXELS_HEADERS = {"Authorization": PEXELS_API_KEY}
-ARROW_FALLBACK = "->"  # guaranteed ASCII
+ARROW_FALLBACK = "->"
 SYSTEM_FONT    = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 
 # ─── GLYPH‑SANITISER ───────────────────────────────────────────────────────────
-#  Converts “fancy” Unicode characters to plain‑ASCII so *any* font works.
 _CHAR_MAP = {
-    "–": "-", "—": "-", "―": "-", "‑": "-",          # dashes & nb‑hyphen
-    "‘": "'", "’": "'", "‚": "'", "‛": "'",            # single quotes
-    "“": '"', "”": '"', "„": '"',                         # double quotes
-    "…": "...", "•": "*",                                  # ellipsis & bullet
-    " ": " ", " ": " ",                                   # nbsp & narrow nbsp
-    "→": "->",                                               # arrow to ASCII
+    "–": "-", "—": "-", "―": "-", "‑": "-",
+    "‘": "'", "’": "'", "‚": "'", "‛": "'",
+    "“": '"', "”": '"', "„": '"',
+    "…": "...", "•": "*",
+    "\u00A0": " ", "\u202F": " ",
+    "→": "->",
 }
 
 def sanitise(txt: str) -> str:
-    """Replace problem glyphs with safe ASCII equivalents."""
     return "".join(_CHAR_MAP.get(c, c) for c in txt)
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 
 def dl(url: str, path: str):
-    """Stream *url* → *path*."""
     with requests.get(url, stream=True, timeout=60) as r, open(path, "wb") as f:
         r.raise_for_status(); shutil.copyfileobj(r.raw, f)
 
 
 def pexels_hd_portrait_mp4s(query: str, n: int) -> list[str]:
-    """Return up to *n* portrait MP4 URLs that are HD and tall enough."""
     collected: list[str] = []
     page = 1
     while len(collected) < n:
         r = requests.get(
             "https://api.pexels.com/videos/search",
             headers=PEXELS_HEADERS,
-            params={
-                "query": query,
-                "orientation": "portrait",
-                "per_page": 80,
-                "page": page,
-            },
+            params={"query": query, "orientation": "portrait", "per_page": 80, "page": page},
             timeout=30,
         )
         r.raise_for_status()
         vids = r.json().get("videos", [])
         if not vids:
-            break  # no more pages
+            break
         for v in vids:
-            # pick the *best* matching file inside the video bundle
             best: _t.Optional[dict] = None
             for f in v.get("video_files", []):
                 if (
@@ -109,7 +100,7 @@ def pexels_hd_portrait_mp4s(query: str, n: int) -> list[str]:
                     and f.get("width", 0) >= MIN_WIDTH
                     and f.get("height", 0) >= MIN_HEIGHT
                 ):
-                    if best is None or f["width"] < best["width"]:  # pick the smaller HD to save bandwidth
+                    if best is None or f["width"] < best["width"]:
                         best = f
             if best:
                 collected.append(best["link"])
@@ -122,7 +113,6 @@ def pexels_hd_portrait_mp4s(query: str, n: int) -> list[str]:
 
 
 def pick_font(text: str) -> str:
-    """Choose a font that supports **all** glyphs in *text*. Fallback to DejaVuSans."""
     chars = {c for c in text if not c.isspace()}
     pool = list(pathlib.Path(FONT_DIR).glob("*.[ot]tf"))
     random.shuffle(pool)
@@ -137,12 +127,10 @@ def pick_font(text: str) -> str:
 def make_caption(raw: str, W: int, H: int) -> ImageClip:
     txt = sanitise(raw)
     font_path = pick_font(txt)
-    base = int(H * 0.05)            # start at ≈5 % height
+    base = int(H * 0.05)
     max_w, max_h = int(W * 0.70), int(H * 0.20)
-
     for sz in range(base, 10, -2):
         font = ImageFont.truetype(font_path, sz)
-        # manual word‑wrap
         lines, cur = [], ""
         for w in txt.split():
             test = (cur + " " + w).strip()
@@ -156,58 +144,127 @@ def make_caption(raw: str, W: int, H: int) -> ImageClip:
             and sum(font.getbbox(l)[3] for l in lines) + int(sz * .6) <= max_h
         ):
             break
-
     pad_x, pad_y = int(sz * .4), int(sz * .25)
     box_w = max(font.getbbox(l)[2] for l in lines) + 2 * pad_x
     box_h = sum(font.getbbox(l)[3] for l in lines) + 2 * pad_y
-
-    img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
-    ImageDraw.Draw(img).rounded_rectangle(
-        [0, 0, box_w, box_h], radius=int(sz * .35), fill="white"
-    )
-
+    img = Image.new("RGBA", (box_w, box_h), (0,0,0,0))
+    ImageDraw.Draw(img).rounded_rectangle([0,0,box_w,box_h], radius=int(sz * .35), fill="white")
     with Pilmoji(img) as dr:
         y = pad_y
         for ln in lines:
             lw = font.getbbox(ln)[2]
-            dr.text(((box_w - lw) // 2, y), ln, font=font, fill="black")
+            dr.text(((box_w - lw)//2, y), ln, font=font, fill="black")
             y += font.getbbox(ln)[3]
     return ImageClip(np.array(img))
 
-# ─── VIRAL CC‑0 MUSIC ───────────────────────────────────────────────────────────
+# ─── YOUTUBE MUSIC → ITUNES PREVIEW POOL ───────────────────────────────────────
 
-def viral_music_url(min_dur: float, rank: int) -> str:
-    """Return URL of the *rank*‑th most‑downloaded CC‑0 sound ≥ *min_dur* (fresh <= TREND_DAYS)."""
-    lower = math.ceil(min_dur) + 1
-    since = (_dt.datetime.utcnow() - _dt.timedelta(days=TREND_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
-    flt = (
-        f'license:"Creative Commons 0" '
-        f'duration:[{lower} TO 10000] '
-        f'created:[{since} TO NOW] '
-        f'tag:music'
-    )
-    params = {
-        "token": FREESOUND_API_KEY,
-        "filter": flt,
-        "sort": "downloads_desc",
-        "page_size": 1,
-        "page": rank,
-        "fields": "id,previews,duration,num_downloads",
-    }
-    r = requests.get("https://freesound.org/apiv2/search/text/", params=params, timeout=30)
-    r.raise_for_status(); res = r.json().get("results", [])
-    if not res:  # fallback: ignore *created* filter to widen pool
-        params["filter"] = flt.replace(f'created:[{since} TO NOW] ', '')
-        r = requests.get("https://freesound.org/apiv2/search/text/", params=params, timeout=30)
-        r.raise_for_status(); res = r.json().get("results", [])
-    if not res:
-        raise RuntimeError("No CC‑0 track of required length :(")
-    item = res[0]
-    return item["previews"].get("preview-hq-mp3") or item["previews"]["preview-lq-mp3"]
+def ytmusic_trending_tracks(country: str, chart_playlists: int, per_pl_limit: int) -> list[dict]:
+    yt = YTMusic()
+    charts = yt.get_charts(country=country)
+    pids: list[str] = []
+    v = charts.get("videos")
+    if isinstance(v, dict) and v.get("playlist"):
+        pids.append(v["playlist"])
+    t = charts.get("trending")
+    if isinstance(t, dict) and t.get("playlist"):
+        pids.append(t["playlist"])
+    for g in charts.get("genres", []):
+        pid = g.get("playlistId")
+        if pid and pid not in pids:
+            pids.append(pid)
+    pids = pids[:max(1, chart_playlists)]
+    tracks: list[dict] = []
+    for pid in pids:
+        wp = yt.get_watch_playlist(playlistId=pid, limit=per_pl_limit)
+        for it in wp.get("tracks", []):
+            title = it.get("title") or ""
+            artists = [a.get("name") for a in (it.get("artists") or []) if a.get("name")]
+            if not artists:
+                by = (it.get("byline") or "").split("•")[0].strip()
+                if by: artists = [by]
+            if title:
+                tracks.append({"title": title, "artists": artists})
+    # de‑dup by (title, first artist)
+    seen=set(); uniq=[]
+    for t in tracks:
+        key=(t['title'].lower(), (t['artists'][0].lower() if t['artists'] else ''))
+        if key in seen: continue
+        seen.add(key); uniq.append(t)
+    return uniq
+
+
+def itunes_preview_for(title: str, artists: list[str], country: str) -> tuple[str, dict] | None:
+    term = f"{title} {artists[0]}" if artists else title
+    params = {"term": term, "media": "music", "entity": "musicTrack", "limit": 10, "country": country}
+    r = requests.get(ITUNES_SEARCH_URL, params=params, timeout=30)
+    r.raise_for_status()
+    items = r.json().get("results", [])
+    if not items: return None
+    tnorm = title.lower()
+    def score(x: dict) -> int:
+        s=0; tn=x.get("trackName","" ).lower(); an=x.get("artistName","" ).lower()
+        if tnorm in tn: s+=3
+        if artists and artists[0].lower() in an: s+=2
+        s += int(x.get("trackTimeMillis",0)//10000)
+        return s
+    items.sort(key=score, reverse=True)
+    for it in items:
+        url = it.get("previewUrl")
+        if url: return url, it
+    return None
+
+
+def _guess_source_ext(url: str, headers: dict) -> str:
+    ctype = (headers.get("Content-Type") or headers.get("content-type") or "").lower()
+    path = urlparse(url).path.lower()
+    if ".mp3" in path or "audio/mpeg" in ctype: return ".mp3"
+    if ".m4a" in path or "audio/mp4" in ctype or "audio/x-m4a" in ctype: return ".m4a"
+    return ".m4a"
+
+
+def _has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def download_preview_audio(url: str, meta: dict, idx: int) -> str:
+    """Download preview and ensure **audio‑only** output. Returns path to audio file."""
+    # HEAD to detect container
+    try:
+        h = requests.head(url, allow_redirects=True, timeout=20); h.raise_for_status()
+        source_ext = _guess_source_ext(url, h.headers)
+    except Exception:
+        source_ext = ".m4a"
+    base = f"__dl_{idx:02d}"
+    tmp = f"{base}{source_ext}"
+    dl(url, tmp)
+    out = f"__tmp_aud_{idx:02d}.mp3"
+    if _has_ffmpeg():
+        subprocess.run(["ffmpeg","-y","-i", tmp, "-vn","-acodec","libmp3lame","-q:a","2", out],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.remove(tmp)
+        return out
+    else:
+        # fallback: just return the original (moviepy can read m4a)
+        return tmp
+
+
+def build_previews_pool(pool_size: int, country: str, chart_playlists: int) -> list[tuple[str,dict]]:
+    tracks = ytmusic_trending_tracks(country, chart_playlists, per_pl_limit=pool_size*2)
+    previews: list[tuple[str,dict]] = []
+    for t in tracks:
+        res = itunes_preview_for(t['title'], t['artists'], country)
+        if res:
+            previews.append(res)
+        if len(previews) >= pool_size:
+            break
+    if not previews:
+        raise RuntimeError("No previews found via iTunes Search.")
+    return previews
 
 # ─── RENDER ONE CLIP ───────────────────────────────────────────────────────────
 
-def render_clip(src_url: str, idx: int):
+def render_clip(src_url: str, idx: int, previews: list[tuple[str,dict]]):
     dl(src_url, TMP_VIDEO)
     clip = VideoFileClip(TMP_VIDEO).without_audio()
     if clip.duration > MAX_DURATION:
@@ -216,38 +273,48 @@ def render_clip(src_url: str, idx: int):
     label = make_caption(CAPTION_TEXT, clip.w, clip.h).set_duration(clip.duration)
     label = label.set_pos(("center", int(clip.h * 0.05)))
 
-    # soundtrack
-    aurl = viral_music_url(clip.duration, idx)
-    print(f"[{idx}] ♫", aurl.split("/")[-1])
-    dl(aurl, TMP_AUDIO)
-    audio = AudioFileClip(TMP_AUDIO)
-    if audio.duration < clip.duration:
-        audio = audio_loop(audio, duration=clip.duration)
+    # pick random preview from pool and make sure it's audio‑only
+    for _ in range(8):
+        url, meta = random.choice(previews)
+        try:
+            audio_path = download_preview_audio(url, meta, idx)
+            audio = AudioFileClip(audio_path)
+            if audio.duration < clip.duration:
+                audio = audio_loop(audio, duration=clip.duration)
+            else:
+                audio = audio.subclip(0, clip.duration)
+            final = clip.set_audio(audio)
+            CompositeVideoClip([final, label]).write_videofile(
+                OUT_TMPL.format(idx), codec="libx264", preset="slow", audio_codec="aac",
+                fps=clip.fps, threads=os.cpu_count() or 4, temp_audiofile="__temp_aac__.m4a",
+                remove_temp=True, ffmpeg_params=["-crf","18"],
+            )
+            break
+        except Exception as e:
+            print(f"[{idx}] preview failed, retrying: {e}")
+            continue
     else:
-        audio = audio.subclip(0, clip.duration)
+        raise RuntimeError("Failed to attach any preview audio.")
 
-    final = clip.set_audio(audio)
-    CompositeVideoClip([final, label]).write_videofile(
-        OUT_TMPL.format(idx),
-        codec="libx264",
-        preset="slow",
-        audio_codec="aac",
-        fps=clip.fps,
-        threads=os.cpu_count() or 4,
-        temp_audiofile="__temp_aac__.m4a",
-        remove_temp=True,
-        ffmpeg_params=["-crf", "18"],
-    )
-    os.remove(TMP_VIDEO); os.remove(TMP_AUDIO)
+    # cleanup
+    try:
+        os.remove(TMP_VIDEO)
+        # remove per‑idx tmp audio if present
+        for p in (f"__tmp_aud_{idx:02d}.mp3", f"__dl_{idx:02d}.m4a", f"__dl_{idx:02d}.mp3"):
+            if os.path.exists(p):
+                os.remove(p)
+    except Exception:
+        pass
 
 # ─── MAIN ───────────────────────────────────────────────────────────────────────
 
 def main():
+    previews = build_previews_pool(POOL_SIZE, YT_COUNTRY, CHART_PLAYLISTS)
     urls = pexels_hd_portrait_mp4s(SEARCH_QUERY, VIDEOS_COUNT)
     for idx, url in enumerate(urls, 1):
         print(f"⇣  ({idx}/{len(urls)})", url.split("/")[-1])
         try:
-            render_clip(url, idx)
+            render_clip(url, idx, previews)
         except Exception as exc:
             print("⚠️  Skipped:", exc)
     print("✓ All done!")
