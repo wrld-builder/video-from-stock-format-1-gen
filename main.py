@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Batch‑builder: fetches the first **N** *HD* portrait clips from Pexels and turns each into a
-≤ 10 s hook‑video with a **random trending YouTube Music preview** as soundtrack
+Batch-builder: fetches the first **N** *HD* portrait clips from Pexels and turns each into a
+≤ 10 s hook-video with a **random trending YouTube Music preview** as soundtrack
 (looked up via iTunes Search) and the caption
-«KITCHEN‑1988 -> DREAM KITCHEN FOR $3,500» (details — see comments 👇).
+«KITCHEN-1988 -> DREAM KITCHEN FOR $3,500» (details — see comments 👇).
 
 What changed vs Freesound version
 ---------------------------------
 * ❌ Removed Freesound. No FREESOUND_API_KEY needed.
 * ✅ Picks a **random** track from a pool of top/trending YouTube Music items.
-* ✅ Audio is saved as **audio‑only** (ffmpeg `-vn`) — no «video disguised as .mp3».
+* ✅ Audio is saved as **audio-only** (ffmpeg `-vn`) — no «video disguised as .mp3».
 
 Dependencies
 ------------
@@ -17,6 +17,12 @@ Dependencies
 Also install ffmpeg: `sudo apt-get install -y ffmpeg` (recommended).
 
 Env vars (mandatory): `PEXELS_API_KEY`.
+
+NEW — self-destruct download server (no extra deps):
+----------------------------------------------------
+Run:  `python3 script.py --serve --port 8000 [--once]`
+Curl: `curl -O http://localhost:8000/dl/hooked_01.mp4`
+After a successful GET the file is deleted from the project folder.
 """
 
 from __future__ import annotations
@@ -27,8 +33,96 @@ from moviepy.audio.fx.audio_loop import audio_loop
 from PIL import Image, ImageDraw, ImageFont
 from pilmoji import Pilmoji
 from ytmusicapi import YTMusic
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 import subprocess
+
+# === NEW: standard-lib HTTP server that deletes served files ===================
+import http.server, socketserver, threading
+from typing import Optional
+
+ALLOWED_EXTS = {".mp4", ".m4a", ".mp3", ".wav", ".webm", ".mov", ".mkv", ".aac", ".flac", ".ogg"}
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+SERVE_PREFIX = os.getenv("SERVE_PREFIX", "/dl/")  # URL prefix for downloads
+
+class SelfDestructHandler(http.server.BaseHTTPRequestHandler):
+    """Serves files under /dl/<relpath> and deletes them right after sending."""
+    once: bool = False  # if True, the server shuts down after first successful send
+
+    def do_GET(self):
+        if not self.path.startswith(SERVE_PREFIX):
+            self.send_error(404, "Unknown route")
+            return
+
+        rel = unquote(self.path[len(SERVE_PREFIX):]).lstrip("/")
+        abs_path = os.path.abspath(os.path.join(PROJECT_ROOT, rel))
+
+        # Security: stay inside project root
+        if not abs_path.startswith(PROJECT_ROOT):
+            self.send_error(403, "Forbidden")
+            return
+
+        ext = os.path.splitext(abs_path)[1].lower()
+        if not os.path.exists(abs_path):
+            self.send_error(404, "Not found")
+            return
+        if ext not in ALLOWED_EXTS:
+            self.send_error(415, "Unsupported media type")
+            return
+
+        # Guess simple content type
+        ctype = (
+            "video/mp4" if ext == ".mp4" else
+            "audio/mpeg" if ext in {".mp3", ".mp2"} else
+            "audio/mp4"  if ext in {".m4a", ".aac"} else
+            "video/webm" if ext == ".webm" else
+            "application/octet-stream"
+        )
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(os.path.getsize(abs_path)))
+            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(abs_path)}"')
+            self.send_header("X-Deleted", "1")
+            self.end_headers()
+            with open(abs_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        except BrokenPipeError:
+            # Client aborted; still try to delete
+            pass
+        finally:
+            try:
+                os.remove(abs_path)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"[WARN] Delete failed for {abs_path}: {e}", flush=True)
+
+        if SelfDestructHandler.once:
+            # shutdown in a separate thread to avoid deadlock in handler thread
+            def _shutdown(server):
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+            threading.Thread(target=_shutdown, args=(self.server,), daemon=True).start()
+
+    def log_message(self, fmt, *args):
+        print(f"[{self.address_string()}] " + (fmt % args), flush=True)
+
+def serve_and_delete(host: str = "0.0.0.0", port: int = 8000, once: bool = False):
+    """Start a simple HTTP server that deletes files after download."""
+    SelfDestructHandler.once = once
+    with socketserver.ThreadingTCPServer((host, port), SelfDestructHandler) as httpd:
+        print(f"Serving self-destruct files at http://{host}:{port}{SERVE_PREFIX}<filename>")
+        print(f"Root: {PROJECT_ROOT} | Allowed extensions: {', '.join(sorted(ALLOWED_EXTS))}")
+        if once:
+            print("Mode: one-shot (server will stop after first successful download)")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+# ==============================================================================
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -38,7 +132,7 @@ if not PEXELS_API_KEY:
 
 SEARCH_QUERY   = "home remodeling"
 CAPTION_TEXT   = (
-    "KITCHEN‑1988 -> DREAM KITCHEN FOR $3,500\n"
+    "KITCHEN-1988 -> DREAM KITCHEN FOR $3,500\n"
     "(details — see comments 👇)"
 )
 VIDEOS_COUNT   = 3      # how many clips per batch
@@ -57,9 +151,9 @@ ARROW_FALLBACK = "->"
 SYSTEM_FONT    = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 
-# ─── GLYPH‑SANITISER ───────────────────────────────────────────────────────────
+# ─── GLYPH-SANITISER ───────────────────────────────────────────────────────────
 _CHAR_MAP = {
-    "–": "-", "—": "-", "―": "-", "‑": "-",
+    "–": "-", "—": "-", "―": "-", "-": "-",
     "‘": "'", "’": "'", "‚": "'", "‛": "'",
     "“": '"', "”": '"', "„": '"',
     "…": "...", "•": "*",
@@ -185,7 +279,7 @@ def ytmusic_trending_tracks(country: str, chart_playlists: int, per_pl_limit: in
                 if by: artists = [by]
             if title:
                 tracks.append({"title": title, "artists": artists})
-    # de‑dup by (title, first artist)
+    # de-dup by (title, first artist)
     seen=set(); uniq=[]
     for t in tracks:
         key=(t['title'].lower(), (t['artists'][0].lower() if t['artists'] else ''))
@@ -228,7 +322,7 @@ def _has_ffmpeg() -> bool:
 
 
 def download_preview_audio(url: str, meta: dict, idx: int) -> str:
-    """Download preview and ensure **audio‑only** output. Returns path to audio file."""
+    """Download preview and ensure **audio-only** output. Returns path to audio file."""
     # HEAD to detect container
     try:
         h = requests.head(url, allow_redirects=True, timeout=20); h.raise_for_status()
@@ -273,7 +367,7 @@ def render_clip(src_url: str, idx: int, previews: list[tuple[str,dict]]):
     label = make_caption(CAPTION_TEXT, clip.w, clip.h).set_duration(clip.duration)
     label = label.set_pos(("center", int(clip.h * 0.05)))
 
-    # pick random preview from pool and make sure it's audio‑only
+    # pick random preview from pool and make sure it's audio-only
     for _ in range(8):
         url, meta = random.choice(previews)
         try:
@@ -299,7 +393,7 @@ def render_clip(src_url: str, idx: int, previews: list[tuple[str,dict]]):
     # cleanup
     try:
         os.remove(TMP_VIDEO)
-        # remove per‑idx tmp audio if present
+        # remove per-idx tmp audio if present
         for p in (f"__tmp_aud_{idx:02d}.mp3", f"__dl_{idx:02d}.m4a", f"__dl_{idx:02d}.mp3"):
             if os.path.exists(p):
                 os.remove(p)
@@ -321,4 +415,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Batch build hooks or serve files with self-destruct.")
+    parser.add_argument("--serve", action="store_true",
+                        help="Start HTTP server that deletes files after successful download.")
+    parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"),
+                        help="Bind host for --serve (default 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")),
+                        help="Bind port for --serve (default 8000)")
+    parser.add_argument("--once", action="store_true",
+                        help="Stop the server after the first successful download.")
+    args = parser.parse_args()
+
+    if args.serve:
+        serve_and_delete(args.host, args.port, args.once)
+    else:
+        main()
